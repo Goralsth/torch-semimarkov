@@ -217,4 +217,4 @@ This library builds on [pytorch-struct](https://github.com/harvardnlp/pytorch-st
 
 ## License
 
-PolyForm Noncommercial License - see [LICENSE](LICENSE) for details.
+PolyForm Noncommercial License - see [LICENSE](LICENSE.md) for details.

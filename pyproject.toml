@@ -7,7 +7,8 @@ name = "flash-semicrf"
 version = "0.2.0"
 description = "Efficient Semi-Markov CRF Inference for PyTorch"
 readme = "README.md"
-license = "MIT"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE.md"]
 authors = [
     {name = "Benjamin K. Johnson", email = "ben.johnson@vai.org"}
 ]
@@ -24,6 +25,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
