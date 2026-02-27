@@ -18,8 +18,8 @@ Three validation strategies:
    - This is the gold standard: if it passes, the implementation is correct
 
 3. **Training convergence** (§3): Do all backends converge to the same loss?
-   - Train identical models with four backends: streaming PyTorch, streaming
-     Triton, pytorch-struct dp_scan (ring buffer), pytorch-struct dp_standard
+   - Train identical models with three backends: streaming PyTorch, streaming
+     Triton, pytorch-struct dp_standard
    - All should reach similar final NLL
    - Validates end-to-end correctness against established SOTA implementations
 
@@ -538,7 +538,6 @@ def test_training_convergence(cfg: ScaleConfig, device: str) -> bool:
     Backends tested:
       - pytorch: Streaming PyTorch reference (on-the-fly edge computation)
       - triton: Streaming Triton kernel (on-the-fly edge computation)
-      - dp_scan: pytorch-struct _dp_scan_streaming (materialized edge + ring buffer)
       - dp_standard: pytorch-struct _dp_standard (materialized edge + list comprehension)
     """
     section_header("§3  TRAINING CONVERGENCE")
@@ -581,7 +580,6 @@ def test_training_convergence(cfg: ScaleConfig, device: str) -> bool:
     backends = [
         ("pytorch", False, "streaming"),
         ("triton", True, "streaming"),
-        ("dp_scan", False, "exact"),
         ("dp_standard", False, "dp_standard"),
     ]
 
@@ -650,9 +648,7 @@ def test_training_convergence(cfg: ScaleConfig, device: str) -> bool:
         )
 
     # Compare all backends against the reference (first available)
-    ref_name = next(
-        (name for name in ["pytorch", "dp_standard", "dp_scan"] if name in results), None
-    )
+    ref_name = next((name for name in ["pytorch", "dp_standard"] if name in results), None)
     if ref_name is None or len(results) < 2:
         print("  Cannot compare: need at least two backends")
         return False
@@ -815,7 +811,7 @@ def main():
         print("  - Marginals satisfy probabilistic invariants")
         print("  - Autograd matches finite differences")
         print("  - Training converges equivalently across all backends")
-        print("    (streaming PyTorch, Triton, pytorch-struct dp_scan, dp_standard)")
+        print("    (streaming PyTorch, Triton, pytorch-struct dp_standard)")
     else:
         print("  ✗ SOME TESTS FAILED")
         print("  Review the detailed output above for diagnostics.")

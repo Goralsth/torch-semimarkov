@@ -22,7 +22,6 @@ import json
 import sys
 from pathlib import Path
 
-
 # ======================================================================
 # LaTeX formatters
 # ======================================================================
@@ -56,7 +55,7 @@ def stability_table(data):
     """§1: Numerical stability table."""
     config = data["config"]
     rows = data["rows"]
-    T_values = sorted(set(r["T"] for r in rows))
+    T_values = sorted({r["T"] for r in rows})
 
     lines = []
     lines.append(r"\begin{table}[t]")
@@ -109,10 +108,18 @@ def combined_prior_table(scenario_data):
     lines = []
     lines.append(r"\begin{table}[t]")
     lines.append(r"\centering")
-    lines.append(r"\caption{Implicit duration prior from \textsc{mean} centering under label imbalance.")
-    lines.append(r"  The per-label temporal mean $\nu_{b,c}$ creates a duration penalty $-\nu_{b,c} \cdot k$")
-    lines.append(r"  that penalizes long segments of prevalent labels and redistributes probability mass")
-    lines.append(r"  to rare labels. Right columns show downstream effect on decoded segmentation.}")
+    lines.append(
+        r"\caption{Implicit duration prior from \textsc{mean} centering under label imbalance."
+    )
+    lines.append(
+        r"  The per-label temporal mean $\nu_{b,c}$ creates a duration penalty $-\nu_{b,c} \cdot k$"
+    )
+    lines.append(
+        r"  that penalizes long segments of prevalent labels and redistributes probability mass"
+    )
+    lines.append(
+        r"  to rare labels. Right columns show downstream effect on decoded segmentation.}"
+    )
     lines.append(r"\label{tab:implicit-prior}")
     lines.append(r"\small")
     lines.append(r"\begin{tabular}{l r r r r r r}")
@@ -152,9 +159,7 @@ def penalty_table(penalty_rows, scenario):
         r"\caption{Implicit duration penalty $-\nu_{b,c} \cdot k$ under \textsc{mean} centering"
         f" ({scenario_label} labels)."
     )
-    lines.append(
-        r"  Globally-prevalent labels (e.g., intron at 70\%) incur a large per-step cost,"
-    )
+    lines.append(r"  Globally-prevalent labels (e.g., intron at 70\%) incur a large per-step cost,")
     lines.append(r"  while rare labels receive a duration bonus.}")
     lines.append(r"\label{tab:penalty-" + scenario + "}")
     lines.append(r"\small")
@@ -215,8 +220,7 @@ def viterbi_table(viterbi_rows, scenario):
     lines.append(r"\begin{table}[t]")
     lines.append(r"\centering")
     lines.append(
-        r"\caption{Viterbi segment lengths by label under"
-        f" {scenario_label} label proportions."
+        r"\caption{Viterbi segment lengths by label under" f" {scenario_label} label proportions."
     )
     lines.append(
         r"  \textsc{mean} centering redistributes segments from prevalent"

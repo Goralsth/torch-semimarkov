@@ -194,14 +194,16 @@ def test_numerical_stability(T_values, C, K, device):
             peak_over_sqrt_T = peak_mag / math.sqrt(T)
             peak_over_T = peak_mag / T
 
-            rows.append({
-                "T": T,
-                "mode": mode,
-                "endpoint_mag": endpoint_mag,
-                "peak_mag": peak_mag,
-                "peak_sqrt_t": peak_over_sqrt_T,
-                "peak_over_t": peak_over_T,
-            })
+            rows.append(
+                {
+                    "T": T,
+                    "mode": mode,
+                    "endpoint_mag": endpoint_mag,
+                    "peak_mag": peak_mag,
+                    "peak_sqrt_t": peak_over_sqrt_T,
+                    "peak_over_t": peak_over_T,
+                }
+            )
 
             print(
                 f"  {T:>7}  {mode:>10}  {endpoint_mag:>14.2f}  "
@@ -434,12 +436,14 @@ def test_duration_prior(device):
             # TV distance: 0.5 * Σ_c |p(t,c) - q(t,c)| averaged over positions
             tv = 0.5 * (m - ref_marginals).abs().sum(dim=2).mean().item()
 
-            partition_rows.append({
-                "mode": mode,
-                "log_z": logZ_by_mode[mode],
-                "tv": tv,
-                "marginal_std": marginal_std,
-            })
+            partition_rows.append(
+                {
+                    "mode": mode,
+                    "log_z": logZ_by_mode[mode],
+                    "tv": tv,
+                    "marginal_std": marginal_std,
+                }
+            )
 
             print(
                 f"    {mode:>10}  {logZ_by_mode[mode]:>14.4f}  "
@@ -519,14 +523,16 @@ def test_duration_prior(device):
         for c in range(C):
             for mode in CENTERING_MODES:
                 s = seg_stats_by_mode[mode][c]
-                viterbi_rows.append({
-                    "label": label_names[c],
-                    "mode": mode,
-                    "n_segments": s["count"],
-                    "mean_len": s["mean"],
-                    "min_len": s["min"],
-                    "max_len": s["max"],
-                })
+                viterbi_rows.append(
+                    {
+                        "label": label_names[c],
+                        "mode": mode,
+                        "n_segments": s["count"],
+                        "mean_len": s["mean"],
+                        "min_len": s["min"],
+                        "max_len": s["max"],
+                    }
+                )
                 print(
                     f"    {label_names[c]:>12}  {mode:>10}  {s['count']:>10}  "
                     f"{s['mean']:>10.1f}  {s['min']:>6}  {s['max']:>6}"
