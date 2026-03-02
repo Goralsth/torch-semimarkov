@@ -947,7 +947,9 @@ def main():
             passed, data = test_self_consistency(cfg, args.device, args.seed)
             json_data["self_consistency"] = data
         elif test_name == "finite-diff":
-            passed, data = test_finite_differences(cfg, args.device, params=args.params, seed=args.seed)
+            passed, data = test_finite_differences(
+                cfg, args.device, params=args.params, seed=args.seed
+            )
             json_data["finite_diff"] = data
         elif test_name == "convergence":
             passed, data = test_training_convergence(cfg, args.device, args.seed)
