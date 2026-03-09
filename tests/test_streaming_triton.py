@@ -871,8 +871,12 @@ class TestTritonStreamingBoundaries:
     def test_triton_boundaries_larger_C(self):
         """Verify boundaries work with C=24 (genomics scale)."""
         batch, T, K, C = 2, 50, 8, 24
+        # Use float64: semi_crf_streaming_forward_pytorch computes in the dtype of its
+        # inputs while the Triton kernel always uses float64 internally.  With C=24,
+        # T=50 and checkpoint-based log normalisation, float32 accumulates ~1 absolute
+        # error vs float64 — far outside the 1e-4 tolerance.
         cum_scores, transition, duration_bias, lengths, proj_start, proj_end = (
-            self.create_boundary_inputs(batch, T, K, C)
+            self.create_boundary_inputs(batch, T, K, C, dtype=torch.float64)
         )
 
         partition_pytorch, _, _, _ = semi_crf_streaming_forward_pytorch(
