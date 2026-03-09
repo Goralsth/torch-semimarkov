@@ -571,10 +571,22 @@ class SemiMarkovCRFHead(nn.Module):
             Tensor: Scalar penalty :math:`\|W_{\text{trans}}\|_p^p + \|W_{\text{dur}}\|_p^p`.
         """
         penalty = self.transition.norm(p=p).pow(p)
-        penalty = penalty + self.duration_bias.norm(p=p).pow(p)
+
+        # Only penalize duration bias if it has learnable parameters.
+        # Imposed distributions (e.g., frozen geometric) produce a constant
+        # offset with no gradient — including it is misleading.
+        #
+        # Note: any() on an empty iterator returns False, which correctly
+        # excludes zero-parameter distributions (UniformDuration uses a
+        # registered buffer; CallableDuration's _device_tracker has
+        # requires_grad=False) without special-casing them.
+        if any(param.requires_grad for param in self.duration_dist.parameters()):
+            penalty = penalty + self.duration_bias.norm(p=p).pow(p)
+
         if self.proj_start_layer is not None:
             penalty = penalty + self.proj_start_layer.weight.norm(p=p).pow(p)
             penalty = penalty + self.proj_end_layer.weight.norm(p=p).pow(p)
+
         return penalty
 
     def _score_gold(

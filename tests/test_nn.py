@@ -836,6 +836,57 @@ class TestScoreGoldBoundary:
             assert abs(actual_delta - expected_delta) < 1e-9
 
 
+class TestParameterPenaltyDurationGating:
+    """Tests for parameter_penalty() gating on learnable duration parameters."""
+
+    def test_parameter_penalty_excludes_frozen_duration(self):
+        """parameter_penalty excludes duration bias when duration is frozen."""
+        from flash_semicrf.duration import GeometricDuration
+        dur_frozen = GeometricDuration(max_duration=8, num_classes=4, learn_rate=False)
+        crf = SemiMarkovCRFHead(num_classes=4, max_duration=8, duration_distribution=dur_frozen)
+
+        # With frozen duration, penalty should only include transition
+        penalty = crf.parameter_penalty()
+        expected = crf.transition.norm(p=2).pow(2)
+        torch.testing.assert_close(penalty, expected)
+
+    def test_parameter_penalty_includes_learnable_duration(self):
+        """parameter_penalty includes duration bias when duration is learnable."""
+        crf = SemiMarkovCRFHead(num_classes=4, max_duration=8)  # default: learned
+
+        penalty = crf.parameter_penalty()
+        expected = crf.transition.norm(p=2).pow(2) + crf.duration_bias.norm(p=2).pow(2)
+        torch.testing.assert_close(penalty, expected)
+
+    def test_parameter_penalty_includes_learnable_geometric_rate(self):
+        """parameter_penalty includes duration bias when geometric has learn_rate=True."""
+        from flash_semicrf.duration import GeometricDuration
+        dur_learnable = GeometricDuration(max_duration=8, num_classes=4, learn_rate=True)
+        crf = SemiMarkovCRFHead(num_classes=4, max_duration=8,
+                                duration_distribution=dur_learnable)
+
+        penalty = crf.parameter_penalty()
+        expected = crf.transition.norm(p=2).pow(2) + crf.duration_bias.norm(p=2).pow(2)
+        torch.testing.assert_close(penalty, expected)
+
+    def test_parameter_penalty_includes_boundary_projections(self):
+        """parameter_penalty always includes boundary projections when enabled."""
+        from flash_semicrf.duration import GeometricDuration
+        # With both frozen duration and boundary projections
+        dur_frozen = GeometricDuration(max_duration=8, num_classes=4, learn_rate=False)
+        crf = SemiMarkovCRFHead(num_classes=4, max_duration=8, hidden_dim=16,
+                                duration_distribution=dur_frozen,
+                                use_boundary_projections=True)
+
+        penalty = crf.parameter_penalty()
+        expected = (
+            crf.transition.norm(p=2).pow(2)
+            + crf.proj_start_layer.weight.norm(p=2).pow(2)
+            + crf.proj_end_layer.weight.norm(p=2).pow(2)
+        )
+        torch.testing.assert_close(penalty, expected)
+
+
 class TestTracebackSingleRegression:
     """Regression tests for _traceback_single 2D/3D shape fix."""
 
