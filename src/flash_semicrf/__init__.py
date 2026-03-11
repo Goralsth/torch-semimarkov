@@ -20,6 +20,9 @@ Modifications:
 - Optimized for genomic segmentation use cases
 """
 
+# Lightning integration (optional — requires lightning>=2.0 or pytorch-lightning>=2.0)
+import importlib.util as _ilu
+
 from .banded import BandedMatrix
 from .banded_utils import (
     apply_permutation,
@@ -47,6 +50,14 @@ from .streaming import (
 )
 from .uncertainty import UncertaintyMixin, UncertaintySemiMarkovCRFHead
 
+if _ilu.find_spec("lightning") or _ilu.find_spec("pytorch_lightning"):
+    from .lightning import SemiCRFLightningModule, pad_and_collate  # noqa: F401
+
+    _LIGHTNING_EXPORTS = ["SemiCRFLightningModule", "pad_and_collate"]
+else:
+    _LIGHTNING_EXPORTS = []
+del _ilu
+
 __version__ = "0.2.0"
 
 __all__ = [
@@ -72,6 +83,8 @@ __all__ = [
     "UniformDuration",
     "CallableDuration",
     "create_duration_distribution",
+    # Lightning integration (optional)
+    *_LIGHTNING_EXPORTS,
     # Benchmark backends
     "BandedMatrix",
     "BlockTriangularMatrix",

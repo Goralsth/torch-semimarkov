@@ -61,6 +61,9 @@ benchmarks = [
 ]
 # NOTE: mamba-ssm requires CUDA. Install separately: pip install mamba-ssm
 cuda = []  # CUDA extension is optional, built separately
+lightning = [
+    "lightning>=2.0",  # also accepts pytorch-lightning>=2.0 via fallback import
+]
 
 [project.urls]
 Homepage = "https://github.com/biobenkj/flash-semicrf"
