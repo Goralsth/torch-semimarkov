@@ -133,6 +133,8 @@ if HAS_TRITON:
         log_norm_ckpt_ptr,  # (batch, num_ckpts) - cumulative log normalization factors
         stride_lnc_b,
         stride_lnc_n,
+        # Mixed precision support
+        USE_FLOAT32: tl.constexpr = False,  # Use float32 for bulk compute (ring buffer, alpha)
     ):
         r"""Streaming Semi-CRF forward scan with on-the-fly edge computation (log semiring).
 
@@ -149,9 +151,19 @@ if HAS_TRITON:
         Saves ring buffer checkpoints at regular intervals for backward pass.
 
         One program is launched per batch element (grid size = batch_size).
+
+        When ``USE_FLOAT32=True``, bulk computation (ring buffer, alpha accumulators,
+        logsumexp) uses float32 instead of float64. Scalar accumulators
+        (``accum_log_norm``, partition) remain float64 for numerical stability.
         """
         # Must match NEG_INF in constants.py
         NEG_INF: tl.constexpr = -1e9
+
+        # Select compute dtype based on precision mode
+        if USE_FLOAT32:
+            COMPUTE_DTYPE: tl.constexpr = tl.float32
+        else:
+            COMPUTE_DTYPE: tl.constexpr = tl.float64
 
         # Batch index (one program per batch element)
         batch_idx = tl.program_id(0)
@@ -212,10 +224,11 @@ if HAS_TRITON:
         # This avoids K iterations of conditional writes per batch element.
 
         # Track final alpha for each batch element
-        final_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
+        final_alpha = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
 
         # Cumulative log normalization factor for numerical stability at extreme T
         # This tracks the total shift applied to alpha values at checkpoint boundaries
+        # MUST stay float64: grows to O(T) magnitude at extreme T
         accum_log_norm = tl.zeros((), dtype=tl.float64)
 
         # Main forward loop: t = 1, 2, ..., T
@@ -225,8 +238,8 @@ if HAS_TRITON:
             active = t.to(tl.int32) <= seq_len
 
             # Online logsumexp accumulators for alpha[t] over (k, c_src)
-            m_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
-            l_alpha = tl.zeros([C_PAD], dtype=tl.float64)
+            m_alpha = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
+            l_alpha = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
             # Loop over valid segment durations k = 1, 2, ..., min(K, t)
             for k in tl.range(1, K + 1):
@@ -331,7 +344,7 @@ if HAS_TRITON:
 
                 # Online logsumexp: accumulate score_for_k into (m_alpha, l_alpha)
                 # 2 exp + 0 log per k (vs pairwise: 2 exp + 1 log per k)
-                score_for_k = score_for_k.to(tl.float64)
+                score_for_k = score_for_k.to(COMPUTE_DTYPE)
                 m_new = tl.maximum(m_alpha, score_for_k)
                 is_m_neginf = m_alpha < (NEG_INF + 1.0)
                 is_score_neginf = score_for_k < (NEG_INF + 1.0)
@@ -512,6 +525,8 @@ if HAS_TRITON:
         log_norm_ckpt_ptr,
         stride_lnc_b,
         stride_lnc_n,
+        # Mixed precision support
+        USE_FLOAT32: tl.constexpr = False,
     ):
         r"""Streaming Semi-CRF forward scan with max semiring (Viterbi decoding).
 
@@ -524,6 +539,12 @@ if HAS_TRITON:
         """
         # Must match NEG_INF in constants.py
         NEG_INF: tl.constexpr = -1e9
+
+        # Select compute dtype based on precision mode
+        if USE_FLOAT32:
+            COMPUTE_DTYPE: tl.constexpr = tl.float32
+        else:
+            COMPUTE_DTYPE: tl.constexpr = tl.float64
 
         batch_idx = tl.program_id(0)
         if batch_idx >= batch_size:
@@ -567,13 +588,13 @@ if HAS_TRITON:
         # - ring_checkpoints[:, 0, 0, :C] = 0.0, rest = NEG_INF
         # This avoids K iterations of conditional writes per batch element.
 
-        final_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
+        final_alpha = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
 
         for t in tl.range(1, T + 1):
             # Include t == seq_len to compute alpha at final position
             # Cast t to int32 to match seq_len type for consistent comparison
             active = t.to(tl.int32) <= seq_len
-            alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
+            alpha_t = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
 
             # Loop over valid segment durations k = 1, 2, ..., min(K, t)
             for k in tl.range(1, K + 1):
@@ -745,6 +766,8 @@ if HAS_TRITON:
         stride_bp_b,
         stride_bp_t,
         stride_bp_c,
+        # Mixed precision support
+        USE_FLOAT32: tl.constexpr = False,
     ):
         r"""Streaming Semi-CRF forward scan with max semiring and backpointer tracking.
 
@@ -758,6 +781,12 @@ if HAS_TRITON:
         """
         # Must match NEG_INF in constants.py
         NEG_INF: tl.constexpr = -1e9
+
+        # Select compute dtype based on precision mode
+        if USE_FLOAT32:
+            COMPUTE_DTYPE: tl.constexpr = tl.float32
+        else:
+            COMPUTE_DTYPE: tl.constexpr = tl.float64
 
         batch_idx = tl.program_id(0)
         if batch_idx >= batch_size:
@@ -795,12 +824,12 @@ if HAS_TRITON:
                 other=0.0,
             )
 
-        final_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
+        final_alpha = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
 
         for t in tl.range(1, T + 1):
             # Cast t to int32 to match seq_len type for consistent comparison
             active = t.to(tl.int32) <= seq_len
-            alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
+            alpha_t = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
 
             # Initialize backpointer tracking for this timestep
             best_k_t = tl.zeros([C_PAD], dtype=tl.int32)
@@ -953,6 +982,7 @@ if HAS_TRITON:
         proj_end: torch.Tensor = None,
         num_warps: int = 4,
         validate_cache: bool = True,
+        precision: str = "float64",
     ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
         r"""launch_streaming_triton_kernel(cum_scores, transition, duration_bias, lengths, K, semiring="log", checkpoint_interval=None, proj_start=None, proj_end=None, num_warps=4, validate_cache=True) -> tuple[Tensor, Tensor, int, Tensor]
 
@@ -1014,11 +1044,16 @@ if HAS_TRITON:
         T = T_plus_1 - 1
         validate_streaming_shapes(K, C, batch, T, transition, duration_bias, proj_start, proj_end)
         device = cum_scores.device
-        dtype = torch.float64  # Internal computation in float64 for numerical stability
+
+        # Select dtype based on precision mode
+        use_float32 = precision == "float32"
+        compute_dtype = torch.float32 if use_float32 else torch.float64
 
         # Compute checkpoint interval if not provided
         if checkpoint_interval is None:
-            checkpoint_interval = _compute_checkpoint_interval(T, K)
+            checkpoint_interval = _compute_checkpoint_interval(
+                T, K, compute_dtype="float32" if use_float32 else "float64"
+            )
         else:
             checkpoint_interval = max(checkpoint_interval, K)
 
@@ -1060,23 +1095,24 @@ if HAS_TRITON:
             stride_ps_b, stride_ps_t, stride_ps_c = 0, 0, 0  # Strides don't matter when not used
 
         # Allocate outputs
+        # Partition always float64 (scalar per batch, adds accum_log_norm which is O(T))
         partition = torch.empty(batch, device=device, dtype=torch.float64)
 
         # Live ring buffer (will be L1/L2 cached for small K*C)
         # Initialize to NEG_INF, then set k=0 to 0.0 (initial alpha state)
-        ring_buffer = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=dtype)
+        ring_buffer = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=compute_dtype)
         ring_buffer[:, 0, :C] = 0.0  # alpha[0, c] = 0.0 for all valid labels
 
         # Checkpoint storage for backward pass
         # Initialize to NEG_INF, then set checkpoint 0, k=0 to 0.0
         ring_checkpoints = torch.full(
-            (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=dtype
+            (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=compute_dtype
         )
         ring_checkpoints[:, 0, 0, :C] = 0.0  # Initial state at checkpoint 0
 
         # Log normalization checkpoint storage for numerical stability at extreme T
         # Stores cumulative log normalization factor at each checkpoint boundary
-        # Memory cost: negligible (14 * batch * 4 bytes at T=100k)
+        # MUST stay float64: these scalars grow to O(T) magnitude
         log_norm_checkpoints = torch.zeros(
             (batch, num_checkpoints), device=device, dtype=torch.float64
         )
@@ -1144,6 +1180,7 @@ if HAS_TRITON:
                 log_norm_checkpoints,
                 stride_lnc_b,
                 stride_lnc_n,
+                USE_FLOAT32=use_float32,
                 num_warps=num_warps,
             )
 
@@ -1163,6 +1200,7 @@ if HAS_TRITON:
         proj_end: torch.Tensor = None,
         num_warps: int = 4,
         validate_cache: bool = True,
+        precision: str = "float64",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""Launch Triton max kernel with backpointer tracking for Viterbi decoding.
 
@@ -1217,11 +1255,16 @@ if HAS_TRITON:
         T = T_plus_1 - 1
         validate_streaming_shapes(K, C, batch, T, transition, duration_bias, proj_start, proj_end)
         device = cum_scores.device
-        dtype = torch.float64  # Internal computation in float64 for numerical stability
+
+        # Select dtype based on precision mode
+        use_float32 = precision == "float32"
+        compute_dtype = torch.float32 if use_float32 else torch.float64
 
         # Compute checkpoint interval if not provided
         if checkpoint_interval is None:
-            checkpoint_interval = _compute_checkpoint_interval(T, K)
+            checkpoint_interval = _compute_checkpoint_interval(
+                T, K, compute_dtype="float32" if use_float32 else "float64"
+            )
         else:
             checkpoint_interval = max(checkpoint_interval, K)
 
@@ -1262,18 +1305,18 @@ if HAS_TRITON:
             stride_ps_b, stride_ps_t, stride_ps_c = 0, 0, 0
 
         # Allocate outputs
-        partition = torch.empty(batch, device=device, dtype=dtype)
+        partition = torch.empty(batch, device=device, dtype=compute_dtype)
         bp_k = torch.zeros((batch, T, C), device=device, dtype=torch.int32)
         bp_c = torch.zeros((batch, T, C), device=device, dtype=torch.int32)
         final_labels = torch.zeros(batch, device=device, dtype=torch.int64)
 
         # Ring buffer
-        ring_buffer = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=dtype)
+        ring_buffer = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=compute_dtype)
         ring_buffer[:, 0, :C] = 0.0
 
         # Checkpoint storage
         ring_checkpoints = torch.full(
-            (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=dtype
+            (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=compute_dtype
         )
         ring_checkpoints[:, 0, 0, :C] = 0.0
 
@@ -1337,6 +1380,7 @@ if HAS_TRITON:
                 stride_bp_b,
                 stride_bp_t,
                 stride_bp_c,
+                USE_FLOAT32=use_float32,
                 num_warps=num_warps,
             )
 

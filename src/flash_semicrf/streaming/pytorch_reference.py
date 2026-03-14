@@ -12,17 +12,31 @@ import torch
 from .constants import NEG_INF
 
 
-def _compute_checkpoint_interval(T: int, K: int) -> int:
+def _compute_checkpoint_interval(T: int, K: int, compute_dtype: str = "float64") -> int:
     """Checkpoint interval balancing memory and numerical stability.
 
     Uses sqrt(T*K) for optimal memory/compute tradeoff, capped to bound
     alpha drift between normalization points in the backward pass.
 
-    When K >= 64, the interval equals K (normalize at every segment boundary).
-    When K < 64, the interval is min(sqrt(T*K), 64), floored at K.
+    For float64 compute:
+        When K >= 64, the interval equals K (normalize at every segment boundary).
+        When K < 64, the interval is min(sqrt(T*K), 64), floored at K.
+
+    For float32 compute:
+        Tighter bound to prevent alpha drift exceeding float32 precision.
+        When K >= 32, the interval equals K.
+        When K < 32, the interval is min(sqrt(T*K), 32), floored at K.
+
+    Args:
+        T: Maximum sequence length.
+        K: Maximum segment duration.
+        compute_dtype: Internal compute precision, ``"float64"`` or ``"float32"``.
     """
     optimal = int(math.sqrt(T * K))
-    max_interval = max(K, 64)
+    if compute_dtype == "float32":
+        max_interval = max(K, 32)
+    else:
+        max_interval = max(K, 64)
     return max(K, min(optimal, max_interval))
 
 

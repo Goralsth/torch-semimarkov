@@ -190,6 +190,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         proj_end: Optional[torch.Tensor] = None,
         num_warps: int = 4,
         checkpoint_interval: Optional[int] = None,
+        precision: str = "float64",
     ) -> torch.Tensor:
         if semiring == "max":
             raise ValueError(
@@ -210,6 +211,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 proj_start=proj_start.detach() if proj_start is not None else None,
                 proj_end=proj_end.detach() if proj_end is not None else None,
                 num_warps=num_warps,
+                precision=precision,
             )
         )
 
@@ -233,6 +235,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         ctx.semiring = semiring
         ctx.checkpoint_interval = actual_checkpoint_interval
         ctx.num_warps = num_warps
+        ctx.precision = precision
 
         return partition_return  # <-- in input dtype for user
 
@@ -278,6 +281,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 proj_start=proj_start,
                 proj_end=proj_end,
                 num_warps=ctx.num_warps,
+                precision=ctx.precision,
             )
         )
 
@@ -320,6 +324,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             grad_proj_end,
             None,  # num_warps
             None,  # checkpoint_interval
+            None,  # precision
         )
 
 
@@ -509,6 +514,7 @@ def semi_crf_streaming_forward(
     use_compile: bool = False,  # Deprecated, kept for API compatibility
     num_warps: int = 4,
     checkpoint_interval: Optional[int] = None,
+    precision: str = "float64",
 ) -> torch.Tensor:
     r"""Compute Semi-CRF partition function with streaming edge computation.
 
@@ -702,6 +708,7 @@ def semi_crf_streaming_forward(
                 proj_end,
                 num_warps,
                 checkpoint_interval,
+                precision,
             )
         else:
             # Pure PyTorch path
@@ -731,6 +738,7 @@ def semi_crf_streaming_forward(
                 proj_start=proj_start,
                 proj_end=proj_end,
                 num_warps=num_warps,
+                precision=precision,
             )
             return partition
         else:

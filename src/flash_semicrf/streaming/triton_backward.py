@@ -150,6 +150,8 @@ if HAS_TRITON:
         stride_lnc_n,
         # Autotuned parameter (must be at end for @triton.autotune)
         TILE_C: tl.constexpr,
+        # Mixed precision support
+        USE_FLOAT32: tl.constexpr = False,  # Use float32 for bulk compute
     ):
         r"""Streaming Semi-CRF backward kernel with loop tiling and online logsumexp.
 
@@ -181,10 +183,14 @@ if HAS_TRITON:
 
         Numerical Stability
         -------------------
-        - **Float64 accumulation**: Gradient tensors use float64 to prevent
-          non-determinism from atomic_add floating-point non-associativity.
-          Error scales as O(sqrt(T*K*C)) per operation; float64 reduces this
-          from ~1e-3 (float32) to ~1e-10 (negligible).
+        - **Float64 for critical scalars**: ``log_Z``, ``accum_log_norm``, and
+          ``log_scale`` remain float64 regardless of ``USE_FLOAT32`` because they
+          involve O(T)-magnitude values whose subtraction requires full precision.
+
+        - **Float32 for bulk compute** (when ``USE_FLOAT32=True``): Alpha/beta
+          accumulators, gradient workspaces, and per-position quantities use float32.
+          Per-segment workspace isolation bounds atomic add count, keeping float32
+          accumulation error negligible.
 
         - **NEG_INF guards**: When all logsumexp inputs are NEG_INF (-1e9),
           the subtraction `scores - max` yields 0 instead of staying at NEG_INF.
@@ -245,6 +251,12 @@ if HAS_TRITON:
         """
         # Must match NEG_INF in constants.py
         NEG_INF: tl.constexpr = -1e9
+
+        # Select compute dtype based on precision mode
+        if USE_FLOAT32:
+            COMPUTE_DTYPE: tl.constexpr = tl.float32
+        else:
+            COMPUTE_DTYPE: tl.constexpr = tl.float64
 
         batch_idx = tl.program_id(0)
         if batch_idx >= batch_size:
@@ -378,8 +390,8 @@ if HAS_TRITON:
                     # Only process if within segment and sequence bounds
                     if t < seg_end and t < seq_len:
                         # Online logsumexp accumulators for alpha_t over k durations
-                        m_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
-                        l_alpha = tl.zeros([C_PAD], dtype=tl.float64)
+                        m_alpha = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
+                        l_alpha = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
                         # Loop over valid segment durations k = 1, 2, ..., K
                         for k in tl.range(1, K + 1):
@@ -493,7 +505,7 @@ if HAS_TRITON:
 
                                 # Online logsumexp: accumulate score_for_k into (m_alpha, l_alpha)
                                 # 2 exp + 0 log per k (vs pairwise: 2 exp + 1 log per k)
-                                score_for_k = score_for_k.to(tl.float64)
+                                score_for_k = score_for_k.to(COMPUTE_DTYPE)
                                 m_new = tl.maximum(m_alpha, score_for_k)
                                 is_m_neginf = m_alpha < (NEG_INF + 1.0)
                                 is_score_neginf = score_for_k < (NEG_INF + 1.0)
@@ -535,8 +547,8 @@ if HAS_TRITON:
 
                         # Compute beta[t] and gradients
                         # Online logsumexp accumulators for new_beta over k durations
-                        m_new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
-                        l_new_beta = tl.zeros([C_PAD], dtype=tl.float64)
+                        m_new_beta = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
+                        l_new_beta = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
                         # === TILED BACKWARD COMPUTATION ===
                         # Process c_dst dimension in tiles of TILE_C to reduce register pressure.
@@ -548,9 +560,7 @@ if HAS_TRITON:
 
                         # === Gradient accumulators (atomic optimization) ===
                         # Accumulate grad_cum_scores[t] across all k and tiles, write once
-                        # Register cost: C_PAD float64 = 512 bytes for C=64 (minimal)
-                        # Speedup: K*tiles atomics -> 1 write (20-50* reduction at K=1000)
-                        grad_cs_t_local = tl.zeros([C_PAD], dtype=tl.float64)
+                        grad_cs_t_local = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
                         # Loop over valid segment durations k = 1, 2, ..., K
                         for k in tl.range(1, K + 1):
@@ -563,21 +573,16 @@ if HAS_TRITON:
 
                                 # === Accumulators for this k iteration ===
                                 # Boundary marginals accumulator (scalar)
-                                # IMPORTANT: Use float64 for tl.range loop-carried variable type consistency
-                                # Note: Use empty shape () to create a scalar tensor, not [1][0]
-                                marginal_sum_all_k = tl.zeros((), dtype=tl.float64)
+                                # Must match COMPUTE_DTYPE for tl.range loop-carried variable type consistency
+                                marginal_sum_all_k = tl.zeros((), dtype=COMPUTE_DTYPE)
 
                                 # Online logsumexp accumulators for beta_k (indexed by c_src)
                                 # Accumulates logsumexp over c_dst tiles
-                                # IMPORTANT: Use float64 to match new_beta precision and avoid
-                                # accumulation errors with higher num_warps
-                                m_beta_k = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
-                                l_beta_k = tl.zeros([C_PAD], dtype=tl.float64)
+                                m_beta_k = tl.full([C_PAD], NEG_INF, dtype=COMPUTE_DTYPE)
+                                l_beta_k = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
                                 # grad_duration_bias accumulator for this k (accumulate across tiles)
-                                # Register cost: C_PAD float64 = 512 bytes for C=64 (minimal)
-                                # Speedup: tiles atomics -> 1 write per k (2-8* reduction per k)
-                                grad_db_k_local = tl.zeros([C_PAD], dtype=tl.float64)
+                                grad_db_k_local = tl.zeros([C_PAD], dtype=COMPUTE_DTYPE)
 
                                 # Clamp alpha_t once per k (reused across tiles)
                                 alpha_t_clamped = tl.minimum(tl.maximum(alpha_t, -1e6), 1e6)
@@ -986,7 +991,7 @@ if HAS_TRITON:
                                     # CRITICAL: Cast to float64 to match accumulator precision.
                                     # Without this, mixed f32/f64 operations in the online logsumexp
                                     # cause catastrophic errors (10^9+) with 2+ tiles.
-                                    max_tile = max_tile.to(tl.float64)
+                                    max_tile = max_tile.to(COMPUTE_DTYPE)
                                     # NEG_INF guard: if all inputs are NEG_INF, max would be NEG_INF
                                     # and scores - max = 0, giving exp(0) = 1 (wrong!). Detect and handle.
                                     is_tile_neginf = max_tile < (NEG_INF + 1.0)
@@ -997,8 +1002,8 @@ if HAS_TRITON:
                                         axis=0,
                                     )
                                     sum_exp_tile = tl.where(is_tile_neginf, 0.0, sum_exp_tile)
-                                    # CRITICAL: Cast to float64 to match accumulator precision.
-                                    sum_exp_tile = sum_exp_tile.to(tl.float64)
+                                    # Cast to match accumulator precision.
+                                    sum_exp_tile = sum_exp_tile.to(COMPUTE_DTYPE)
 
                                     # Online update: merge this tile's statistics with running accumulator
                                     m_new = tl.maximum(m_beta_k, max_tile)
@@ -1047,7 +1052,7 @@ if HAS_TRITON:
 
                                 # Online logsumexp: accumulate beta_k into (m_new_beta, l_new_beta)
                                 # 2 exp + 0 log per k (vs pairwise: 2 exp + 1 log per k)
-                                beta_k = beta_k.to(tl.float64)
+                                beta_k = beta_k.to(COMPUTE_DTYPE)
                                 m_new = tl.maximum(m_new_beta, beta_k)
                                 is_m_neginf = m_new_beta < (NEG_INF + 1.0)
                                 is_bk_neginf = beta_k < (NEG_INF + 1.0)
@@ -1154,6 +1159,7 @@ if HAS_TRITON:
         return_boundary_marginals: bool = False,
         num_warps: int = 4,
         validate_cache: bool = True,
+        precision: str = "float64",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""launch_streaming_triton_backward(cum_scores, transition, duration_bias, lengths, log_Z, ring_checkpoints, log_norm_checkpoints, checkpoint_interval, grad_output, proj_start=None, proj_end=None, return_boundary_marginals=False, num_warps=4, validate_cache=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
@@ -1271,7 +1277,8 @@ if HAS_TRITON:
             )
 
         device = cum_scores.device
-        dtype = torch.float64  # Must match ring_checkpoints dtype from forward pass
+        use_float32 = precision == "float32"
+        compute_dtype = torch.float32 if use_float32 else torch.float64
 
         num_checkpoints = ring_checkpoints.shape[1]
         C_PAD = _next_power_of_2(C)
@@ -1324,14 +1331,14 @@ if HAS_TRITON:
             grad_proj_end = None
             # Kernel uses proj_start/proj_end directly when HAS_BOUNDARY_PROJ=False
 
-        # Pad checkpoints to C_PAD
+        # Pad checkpoints to C_PAD (match forward's compute_dtype)
         if ring_checkpoints.shape[-1] < C_PAD:
             ring_ckpts_padded = torch.full(
-                (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=dtype
+                (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=compute_dtype
             )
-            ring_ckpts_padded[:, :, :, :C] = ring_checkpoints
+            ring_ckpts_padded[:, :, :, :C] = ring_checkpoints.to(compute_dtype)
         else:
-            ring_ckpts_padded = ring_checkpoints.contiguous()
+            ring_ckpts_padded = ring_checkpoints.to(compute_dtype).contiguous()
 
         # Ensure log normalization checkpoints are contiguous
         log_norm_checkpoints = log_norm_checkpoints.contiguous()
@@ -1344,44 +1351,43 @@ if HAS_TRITON:
         # Without segment isolation, segment 1 (processed first in backward) writes to
         # alpha_buffer[batch, 0, :], then segment 0 reads stale values instead of checkpoint.
         alpha_buffer = torch.full(
-            (batch, num_segments, segment_size, C_PAD), NEG_INF, device=device, dtype=dtype
+            (batch, num_segments, segment_size, C_PAD), NEG_INF, device=device, dtype=compute_dtype
         )
-        beta_ring = torch.full((batch, 2 * K, C_PAD), NEG_INF, device=device, dtype=dtype)
+        beta_ring = torch.full((batch, 2 * K, C_PAD), NEG_INF, device=device, dtype=compute_dtype)
 
         # NUMERICAL STABILITY: Selective precision for gradient tensors.
-        # - grad_cum_scores: O(B*T*C) but per-position (no cross-T accumulation) -> float32 OK
-        # - grad_transition, grad_duration_bias: small but accumulated across all T -> need float64
-        # The kernel-internal accumulators still use tl.float64 for log-sum-exp safety.
+        # - grad_cum_scores: per-position (no cross-T accumulation) -> always float32
+        # - grad_transition, grad_duration_bias: per-segment workspace isolation bounds
+        #   atomic add count, making compute_dtype sufficient. Host-side sum over segments
+        #   and einsum with grad_output use float64 for final reduction.
 
         # Allocate gradient outputs with C_PAD
         # grad_cum_scores is per-position, doesn't accumulate across T -> float32 sufficient
         grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=torch.float32)
-        # grad_duration_bias accumulates across all T positions -> needs float64
+        # grad_duration_bias: final output (reduced on host in float64)
         grad_duration_bias = torch.zeros(K, C, device=device, dtype=torch.float64)
 
         # Allocate per-batch-per-segment workspace buffers for deterministic gradients.
         # Each segment writes to its own workspace slice, eliminating atomic contention
         # across segments. Host-side sum over segments is deterministic.
-        #
-        # NUMERICAL STABILITY: Use float64 for accumulation across T.
         # PADDING: Use C_PAD to prevent OOB memory access from masked-out threads.
         if has_duration_transitions:
             # Duration-dependent: (batch, num_segments, K, C_PAD, C_PAD)
             grad_tr_workspace = torch.zeros(
-                batch, num_segments, K, C_PAD, C_PAD, device=device, dtype=torch.float64
+                batch, num_segments, K, C_PAD, C_PAD, device=device, dtype=compute_dtype
             )
         else:
             # Static: (batch, num_segments, C_PAD, C_PAD)
             grad_tr_workspace = torch.zeros(
-                batch, num_segments, C_PAD, C_PAD, device=device, dtype=torch.float64
+                batch, num_segments, C_PAD, C_PAD, device=device, dtype=compute_dtype
             )
         grad_db_workspace = torch.zeros(
-            batch, num_segments, K, C_PAD, device=device, dtype=torch.float64
+            batch, num_segments, K, C_PAD, device=device, dtype=compute_dtype
         )
 
         # Allocate boundary marginals output if requested
         if return_boundary_marginals:
-            boundary_marginals = torch.zeros(batch, T, device=device, dtype=dtype)
+            boundary_marginals = torch.zeros(batch, T, device=device, dtype=compute_dtype)
             stride_bm_b, stride_bm_t = boundary_marginals.stride()
         else:
             boundary_marginals = grad_cum_scores[:, :T, 0]  # Dummy (won't be written)
@@ -1500,6 +1506,7 @@ if HAS_TRITON:
                 stride_lnc_b,
                 stride_lnc_n,
                 TILE_C=tile_c,
+                USE_FLOAT32=use_float32,
                 num_warps=num_warps,
             )
 
@@ -1528,29 +1535,31 @@ if HAS_TRITON:
         #
         # Slice workspaces back to actual class count C before reduction
         # (they were allocated with C_PAD to prevent OOB memory access)
-        # Convert grad_output to float64 to match workspace dtype for accumulated gradients
+        # Host-side reduction ALWAYS uses float64 for numerical precision,
+        # regardless of kernel compute_dtype. Upcast workspaces before sum/einsum.
         grad_output_f64 = grad_output.to(torch.float64)
         if has_duration_transitions:
             # (batch, num_segments, K, C_PAD, C_PAD) -> sum over segments -> (batch, K, C, C)
-            grad_tr_workspace = grad_tr_workspace[:, :, :, :C, :C].sum(dim=1)
+            grad_tr_workspace = grad_tr_workspace[:, :, :, :C, :C].to(torch.float64).sum(dim=1)
             grad_transition = torch.einsum("bkij, b -> kij", grad_tr_workspace, grad_output_f64)
         else:
             # (batch, num_segments, C_PAD, C_PAD) -> sum over segments -> (batch, C, C)
-            grad_tr_workspace = grad_tr_workspace[:, :, :C, :C].sum(dim=1)
+            grad_tr_workspace = grad_tr_workspace[:, :, :C, :C].to(torch.float64).sum(dim=1)
             grad_transition = torch.einsum("bij, b -> ij", grad_tr_workspace, grad_output_f64)
 
         # (batch, num_segments, K, C_PAD) -> sum over segments -> (batch, K, C)
-        grad_db_workspace = grad_db_workspace[:, :, :, :C].sum(dim=1)
+        grad_db_workspace = grad_db_workspace[:, :, :, :C].to(torch.float64).sum(dim=1)
         grad_duration_bias = torch.einsum("bkc, b -> kc", grad_db_workspace, grad_output_f64)
 
-        # Slice padded gradients back to actual class count C and convert to original dtype
-        grad_cum_scores = grad_cum_scores[:, :, :C].to(dtype)
-        grad_transition = grad_transition.to(dtype)
-        grad_duration_bias = grad_duration_bias.to(dtype)
+        # Slice padded gradients back to actual class count C and convert to float64
+        # (autograd layer will cast to input dtype)
+        grad_cum_scores = grad_cum_scores[:, :, :C].to(torch.float64)
+        grad_transition = grad_transition.to(torch.float64)
+        grad_duration_bias = grad_duration_bias.to(torch.float64)
 
         if grad_proj_start is not None:
-            grad_proj_start = grad_proj_start[:, :, :C].to(dtype)
-            grad_proj_end = grad_proj_end[:, :, :C].to(dtype)
+            grad_proj_start = grad_proj_start[:, :, :C].to(torch.float64)
+            grad_proj_end = grad_proj_end[:, :, :C].to(torch.float64)
 
         return (
             grad_cum_scores,

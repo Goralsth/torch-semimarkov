@@ -118,7 +118,9 @@ class SemiMarkovCRFHead(nn.Module):
         >>> loss.backward()
 
     .. note::
-        For T > 100K, use float64 precision for numerical stability.
+        For T > 100K, use ``precision="float64"`` (the default) for numerical stability.
+        For shorter sequences or on GPUs with poor FP64 throughput (e.g. L40S),
+        ``precision="float32"`` can give 2-4x speedup with negligible accuracy loss.
     """
 
     def __init__(
@@ -131,12 +133,14 @@ class SemiMarkovCRFHead(nn.Module):
         edge_memory_threshold: float = 8e9,
         num_warps: int = 4,
         use_boundary_projections: bool = False,
+        precision: str = "float64",
     ):
         super().__init__()
         self.num_classes = num_classes
         self.max_duration = max_duration
         self.edge_memory_threshold = edge_memory_threshold
         self.num_warps = num_warps
+        self.precision = precision
 
         # CRF parameters
         self.transition = nn.Parameter(torch.randn(num_classes, num_classes) * init_scale)
@@ -488,6 +492,7 @@ class SemiMarkovCRFHead(nn.Module):
                 num_warps=self.num_warps,
                 proj_start=proj_start,
                 proj_end=proj_end,
+                precision=self.precision,
             )
         elif backend_type == "binary_tree_sharded":
             # Use sharded binary tree backend for memory-efficient reference implementation
@@ -692,6 +697,7 @@ class SemiMarkovCRFHead(nn.Module):
                 num_warps=self.num_warps,
                 proj_start=proj_start,
                 proj_end=proj_end,
+                precision=self.precision,
             )
         elif backend_type == "binary_tree_sharded":
             # Use sharded binary tree backend for memory-efficient reference implementation
