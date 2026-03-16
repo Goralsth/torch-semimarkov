@@ -836,7 +836,12 @@ class SemiMarkovCRFHead(nn.Module):
 
         # Streaming backend - use batched Viterbi with backpointers
         if any_needs_traceback:
-            can_use_triton = False  # Triton backpointer disabled (memory corruption)
+            can_use_triton = (
+                HAS_TRITON and use_triton and cum_scores.is_cuda and self.max_duration >= 3
+            )
+            # Single-boundary fallback: Triton requires both or neither
+            if can_use_triton and (proj_start is None) != (proj_end is None):
+                can_use_triton = False
 
             # Get max scores AND backpointers in a single forward pass
             if can_use_triton:
