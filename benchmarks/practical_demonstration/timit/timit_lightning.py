@@ -167,6 +167,17 @@ if HAS_LIGHTNING:
                 self.log(
                     "val/entropy_max", entropy.max(), on_step=False, on_epoch=True, sync_dist=True
                 )
+                # Per-position label entropy: informative for K=1 where boundary
+                # entropy is trivially uniform (every frame is a boundary).
+                pos_margs = self.crf.compute_position_marginals(hidden, batch["lengths"])
+                # H(t) = -sum_c p(c|t) log p(c|t), averaged over valid frames
+                pos_log = torch.log(pos_margs.clamp(min=1e-10))
+                pos_ent = -(pos_margs * pos_log).sum(dim=-1)  # (batch, T)
+                mask = torch.arange(pos_ent.shape[1], device=pos_ent.device).unsqueeze(0) < batch["lengths"].unsqueeze(1)
+                pos_ent_mean = (pos_ent * mask).sum() / mask.sum()
+                self.log(
+                    "val/position_entropy_mean", pos_ent_mean, on_step=False, on_epoch=True, sync_dist=True
+                )
 
             result = self.crf.decode_with_traceback(hidden, batch["lengths"])
 
