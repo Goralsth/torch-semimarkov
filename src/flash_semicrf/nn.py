@@ -272,6 +272,30 @@ class SemiMarkovCRFHead(nn.Module):
             self.proj_end_layer(hidden_states).double(),  # (batch, T, C)
         )
 
+    @staticmethod
+    def _center_scores(scores: Tensor, lengths: Tensor) -> Tensor:
+        """Subtract per-sequence masked mean from scores before cumsum.
+
+        Computes the mean over valid positions only (u < lengths[b]),
+        so padding tokens do not influence the centering baseline.
+
+        Args:
+            scores: Raw projected scores ``(batch, T, C)`` in any dtype.
+            lengths: Sequence lengths ``(batch,)``.
+
+        Returns:
+            Centered scores in float64, same shape as input.
+        """
+        scores_float = scores.double()
+        T = scores_float.shape[1]
+        if T <= 1:
+            return scores_float
+        # Mask: (batch, T, 1) — True for valid positions
+        mask = torch.arange(T, device=scores.device)[None, :] < lengths[:, None]
+        masked_scores = scores_float * mask.unsqueeze(-1)  # zero out padding
+        baseline = masked_scores.sum(dim=1, keepdim=True) / lengths[:, None, None].double()
+        return scores_float - baseline
+
     def _apply_sequence_boundaries(
         self,
         proj_start: Optional[Tensor],
@@ -340,11 +364,7 @@ class SemiMarkovCRFHead(nn.Module):
         K = self.max_duration
 
         # Cumulative scores for content computation
-        # Zero-center before cumsum to match streaming preprocessing
-        # Skip for T=1 since mean of single value zeros out content scores
-        scores_float = scores.double()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        scores_float = self._center_scores(scores, lengths)
         cum_scores = torch.zeros(batch, T + 1, C, dtype=torch.float64, device=scores.device)
         cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
@@ -389,9 +409,7 @@ class SemiMarkovCRFHead(nn.Module):
         batch, T, C = scores.shape
         K = self.max_duration
 
-        scores_float = scores.double()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        scores_float = self._center_scores(scores, lengths)
 
         # Build cum_scores without in-place ops to preserve autograd graph
         cumsum_vals = torch.cumsum(scores_float, dim=1)
@@ -548,11 +566,7 @@ class SemiMarkovCRFHead(nn.Module):
 
         # Build cumulative scores for prefix-sum edge retrieval
         # CRITICAL: Use float64 for numerical stability at T > 100K
-        # Zero-center before cumsum to prevent magnitude drift at long sequences
-        # Skip for T=1 since mean of single value zeros out content scores
-        scores_float = scores.double()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        scores_float = self._center_scores(scores, lengths)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float64, device=scores.device
         )
@@ -767,11 +781,7 @@ class SemiMarkovCRFHead(nn.Module):
         self._validate_backend_for_boundaries(backend)
 
         # Build cumulative scores
-        # Zero-center before cumsum to prevent magnitude drift at long sequences
-        # Skip for T=1 since mean of single value zeros out content scores
-        scores_float = scores.double()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        scores_float = self._center_scores(scores, lengths)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float64, device=scores.device
         )
@@ -846,11 +856,7 @@ class SemiMarkovCRFHead(nn.Module):
             scores = hidden_states
 
         # Build cumulative scores
-        # Zero-center before cumsum to prevent magnitude drift at long sequences
-        # Skip for T=1 since mean of single value zeros out content scores
-        scores_float = scores.double()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        scores_float = self._center_scores(scores, lengths)
         cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float64, device=device)
         cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 

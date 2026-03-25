@@ -180,10 +180,8 @@ class UncertaintyMixin:
         else:
             scores = hidden_states
 
-        # Zero-center scores to match exact method preprocessing (see nn.py _build_edge_tensor)
-        scores_float = scores.double().detach()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        # Zero-center scores using masked mean (see nn.py _center_scores)
+        scores_float = self._center_scores(scores.detach(), lengths)
 
         # Build cumulative scores
         cum_scores = torch.zeros(
@@ -311,10 +309,8 @@ class UncertaintyMixin:
             # Make scores require grad
             scores_for_grad = scores.detach().requires_grad_(True)
 
-            # Zero-center scores to match exact method preprocessing (see nn.py _build_edge_tensor)
-            scores_centered = scores_for_grad.double()
-            if T > 1:
-                scores_centered = scores_centered - scores_centered.mean(dim=1, keepdim=True)
+            # Zero-center scores using masked mean (see nn.py _center_scores)
+            scores_centered = self._center_scores(scores_for_grad, lengths)
 
             # Build cumulative scores
             cum_scores = torch.zeros(
