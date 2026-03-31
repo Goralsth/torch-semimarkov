@@ -14,7 +14,7 @@ Place this script in the ``benchmarks/`` directory alongside
 ``benchmark_memory_analysis.py`` so that ``from lib import ...`` resolves.
 
 Usage:
-    # Default: Triton + Streaming scan, K=50, C=24
+    # Default: Triton + Streaming scan, K=50, C=24 (custom sweep)
     python benchmarks/benchmark_t_sweep.py
 
     # All backends (exact ones will OOM at large T — that's the point)
@@ -84,12 +84,20 @@ ALL_BACKENDS = [
 
 REGIMES = {
     "ner": {
-        "description": "NER-scale comparison (all backends viable)",
+        "description": "NER-scale (CoNLL-2003 BIO tagging, C=9, KC=144)",
         "K": 16,
-        "C": 24,
-        "B": 2,
+        "C": 9,
+        "B": 4,
         "T": [64, 128, 256, 512, 1024, 2048, 4096],
         "backends": ALL_BACKENDS,
+    },
+    "speech": {
+        "description": "Speech segmentation (TIMIT phone boundaries, C=39, KC=1170)",
+        "K": 30,
+        "C": 39,
+        "B": 4,
+        "T": [200, 300, 500, 1000, 2000, 5000, 10000, 20000],
+        "backends": ["triton_streaming", "linear_scan_streaming"],
     },
     "streaming": {
         "description": "Genomics-scale streaming-only (chromosome-length)",
@@ -727,9 +735,10 @@ def main():
         type=str,
         default=None,
         choices=list(REGIMES.keys()),
-        help="Benchmark regime preset. NER-scale, all backends (K=16,C=24,T=64-4K). "
-        "'streaming': genomics-scale, streaming only (K=200,C=6,T=10K-1M). "
-        "Explicit --K/--C/--T/--backends flags override regime defaults.",
+        help="Benchmark regime preset. 'ner': CoNLL-2003 BIO scale, all backends "
+        "(K=16,C=9,T=64-4K). 'speech': TIMIT phone segmentation, streaming only "
+        "(K=30,C=39,T=500-20K). 'streaming': genomics-scale, streaming only "
+        "(K=200,C=6,T=10K-1M). Explicit --K/--C/--T/--backends flags override.",
     )
     parser.add_argument(
         "--quick", action="store_true", help="Quick mode: fewer T values, fewer repeats"

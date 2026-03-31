@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Example: Using SemiMarkovCRFHead with PyTorch Lightning.
+"""Example: Using SemiCRFLightningModule with PyTorch Lightning.
 
 This example demonstrates how to integrate flash-semicrf with PyTorch Lightning
 for distributed training of sequence segmentation models.
 
 Key points:
-1. SemiMarkovCRFHead wraps Triton kernels in a simple nn.Module
-2. DDP works automatically - no special handling needed
-3. Must use precision=32 for numerical stability at T > 100K
+1. SemiCRFLightningModule wraps any encoder + SemiMarkovCRFHead (or Uncertainty head)
+2. DDP works automatically — no special handling needed
+3. Must use precision=32 for numerical stability (the streaming algorithm requires float64)
+4. pad_and_collate handles variable-length sequences in DataLoaders
 
 Usage:
     # Single GPU
@@ -20,30 +21,45 @@ Usage:
     python lightning_integration.py --accelerator cpu
 """
 
+from __future__ import annotations
+
 import argparse
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-# Check for Lightning availability
+# ---------------------------------------------------------------------------
+# Lightning import (supports lightning>=2.0 and legacy pytorch-lightning)
+# ---------------------------------------------------------------------------
 try:
-    import pytorch_lightning as L
-    from pytorch_lightning.callbacks import LearningRateMonitor
+    import lightning.pytorch as L
+    from lightning.pytorch.callbacks import LearningRateMonitor
 
     HAS_LIGHTNING = True
 except ImportError:
-    HAS_LIGHTNING = False
-    print("PyTorch Lightning not installed. Install with: pip install pytorch-lightning")
+    try:
+        import pytorch_lightning as L  # type: ignore[no-redef]
+        from pytorch_lightning.callbacks import LearningRateMonitor  # type: ignore[no-redef]
 
-from flash_semicrf import SemiMarkovCRFHead
+        HAS_LIGHTNING = True
+    except ImportError:
+        HAS_LIGHTNING = False
+        print(
+            "PyTorch Lightning not installed. " "Install with: pip install flash-semicrf[lightning]"
+        )
+
+from flash_semicrf import SemiCRFLightningModule, SemiMarkovCRFHead, pad_and_collate
+from flash_semicrf.uncertainty import UncertaintySemiMarkovCRFHead
+
+# ---------------------------------------------------------------------------
+# Encoder (replace with your actual encoder: Mamba, Transformer, CNN, etc.)
+# ---------------------------------------------------------------------------
 
 
 class SimpleEncoder(nn.Module):
-    """Simple encoder for demonstration purposes.
-
-    In practice, replace this with your actual encoder (Mamba, Transformer, CNN, etc.)
-    """
+    """Simple encoder for demonstration purposes."""
 
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2):
         super().__init__()
@@ -60,24 +76,23 @@ class SimpleEncoder(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
+    def forward(self, x: Tensor) -> Tensor:
+        """Args:
             x: Input token IDs of shape (batch, T)
 
         Returns:
             Hidden states of shape (batch, T, hidden_dim)
         """
-        h = self.embedding(x)
-        return self.layers(h)
+        return self.layers(self.embedding(x))
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 
 class DummyDataset(Dataset):
-    """Dummy dataset for demonstration.
-
-    Generates random sequences with random segment labels.
-    """
+    """Synthetic dataset with random sequences and segment labels."""
 
     def __init__(
         self,
@@ -91,25 +106,18 @@ class DummyDataset(Dataset):
         self.vocab_size = vocab_size
         self.num_classes = num_classes
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Random sequence
         inputs = torch.randint(0, self.vocab_size, (self.seq_length,))
-
-        # Random segment labels (create segments of varying length)
         labels = torch.zeros(self.seq_length, dtype=torch.long)
         pos = 0
         while pos < self.seq_length:
-            # Random segment length (1 to 20)
-            seg_len = torch.randint(1, 21, (1,)).item()
-            seg_len = min(seg_len, self.seq_length - pos)
-            # Random label
+            seg_len = min(torch.randint(1, 21, (1,)).item(), self.seq_length - pos)
             label = torch.randint(0, self.num_classes, (1,)).item()
             labels[pos : pos + seg_len] = label
             pos += seg_len
-
         return {
             "inputs": inputs,
             "labels": labels,
@@ -117,94 +125,91 @@ class DummyDataset(Dataset):
         }
 
 
-def collate_fn(batch):
-    """Collate function for DataLoader."""
-    return {
-        "inputs": torch.stack([item["inputs"] for item in batch]),
-        "labels": torch.stack([item["labels"] for item in batch]),
-        "lengths": torch.stack([item["lengths"] for item in batch]),
-    }
-
+# ---------------------------------------------------------------------------
+# DataModule (concrete Lightning DataModule using pad_and_collate)
+# ---------------------------------------------------------------------------
 
 if HAS_LIGHTNING:
 
-    class SegmentationModel(L.LightningModule):
-        """PyTorch Lightning module for sequence segmentation.
+    class DummyDataModule(L.LightningDataModule):
+        """Example DataModule with variable-length sequence support.
 
-        This demonstrates how to use SemiMarkovCRFHead in a LightningModule
-        for distributed training.
+        Uses :func:`~flash_semicrf.pad_and_collate` as the collate function.
+        Lightning automatically handles DistributedSampler in DDP — do NOT
+        construct it manually.
         """
 
         def __init__(
             self,
+            num_samples: int = 1000,
+            seq_length: int = 100,
             vocab_size: int = 5,
-            hidden_dim: int = 64,
             num_classes: int = 10,
-            max_duration: int = 50,
-            learning_rate: float = 1e-3,
+            batch_size: int = 32,
+            num_workers: int = 0,
         ):
             super().__init__()
-            self.save_hyperparameters()
+            self.num_samples = num_samples
+            self.seq_length = seq_length
+            self.vocab_size = vocab_size
+            self.num_classes = num_classes
+            self.batch_size = batch_size
+            self.num_workers = num_workers
 
-            # Encoder
-            self.encoder = SimpleEncoder(vocab_size, hidden_dim)
+            self.train_dataset: DummyDataset | None = None
+            self.val_dataset: DummyDataset | None = None
 
-            # CRF head (this wraps Triton streaming kernels)
-            self.crf = SemiMarkovCRFHead(
-                num_classes=num_classes,
-                max_duration=max_duration,
-                hidden_dim=hidden_dim,
+        def setup(self, stage=None):
+            self.train_dataset = DummyDataset(
+                num_samples=self.num_samples,
+                seq_length=self.seq_length,
+                vocab_size=self.vocab_size,
+                num_classes=self.num_classes,
+            )
+            self.val_dataset = DummyDataset(
+                num_samples=max(self.num_samples // 10, 10),
+                seq_length=self.seq_length,
+                vocab_size=self.vocab_size,
+                num_classes=self.num_classes,
             )
 
-        def forward(self, inputs, lengths):
-            """Forward pass returning partition function."""
-            h = self.encoder(inputs)
-            return self.crf(h, lengths)
-
-        def training_step(self, batch, batch_idx):
-            """Training step with NLL loss."""
-            h = self.encoder(batch["inputs"])
-            loss = self.crf.compute_loss(h, batch["lengths"], batch["labels"])
-
-            # Log metrics (sync_dist=True for DDP)
-            self.log("train/loss", loss, prog_bar=True, sync_dist=True)
-
-            return loss
-
-        def validation_step(self, batch, batch_idx):
-            """Validation step."""
-            h = self.encoder(batch["inputs"])
-            loss = self.crf.compute_loss(h, batch["lengths"], batch["labels"])
-
-            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-
-            return loss
-
-        def configure_optimizers(self):
-            """Configure optimizer with separate parameter groups.
-
-            CRF parameters (transition, duration_bias) often benefit from
-            a lower learning rate than the encoder.
-            """
-            encoder_params = list(self.encoder.parameters())
-            crf_params = list(self.crf.parameters())
-
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": encoder_params, "lr": self.hparams.learning_rate},
-                    {
-                        "params": crf_params,
-                        "lr": self.hparams.learning_rate * 0.1,
-                    },  # Lower LR for CRF
-                ],
-                weight_decay=0.01,
+        def train_dataloader(self) -> DataLoader:
+            # shuffle=True is converted to DistributedSampler(shuffle=True) by
+            # Lightning in DDP — do NOT construct DistributedSampler manually.
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                collate_fn=pad_and_collate,
             )
 
-            return optimizer
+        def val_dataloader(self) -> DataLoader:
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                collate_fn=pad_and_collate,
+            )
+
+        def predict_dataloader(self) -> DataLoader:
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                collate_fn=pad_and_collate,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lightning + SemiMarkovCRFHead Example")
+    parser = argparse.ArgumentParser(description="Lightning + SemiCRFLightningModule Example")
     parser.add_argument("--devices", type=int, default=1, help="Number of GPUs")
     parser.add_argument("--strategy", type=str, default="auto", help="Training strategy (ddp, etc)")
     parser.add_argument("--accelerator", type=str, default="auto", help="Accelerator (gpu, cpu)")
@@ -214,76 +219,72 @@ def main():
     parser.add_argument("--num_classes", type=int, default=10, help="Number of classes")
     parser.add_argument("--max_duration", type=int, default=50, help="Max segment duration")
     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension")
+    parser.add_argument(
+        "--uncertainty", action="store_true", help="Use UncertaintySemiMarkovCRFHead"
+    )
     args = parser.parse_args()
 
     if not HAS_LIGHTNING:
-        print("PyTorch Lightning is required for this example.")
-        print("Install with: pip install pytorch-lightning")
+        print("PyTorch Lightning is required. Install with: pip install flash-semicrf[lightning]")
         return
 
-    # Create datasets
-    train_dataset = DummyDataset(
+    # Build encoder
+    encoder = SimpleEncoder(vocab_size=5, hidden_dim=args.hidden_dim)
+
+    # Build CRF head
+    crf_cls = UncertaintySemiMarkovCRFHead if args.uncertainty else SemiMarkovCRFHead
+    crf = crf_cls(
+        num_classes=args.num_classes,
+        max_duration=args.max_duration,
+        hidden_dim=args.hidden_dim,
+    )
+
+    # Build Lightning module
+    model = SemiCRFLightningModule(
+        encoder=encoder,
+        crf=crf,
+        lr=1e-3,
+        crf_lr_scale=0.1,  # transition/duration params trained at lower LR
+        scheduler="plateau",
+        log_uncertainty_stats=args.uncertainty,
+    )
+
+    # DataModule
+    datamodule = DummyDataModule(
         num_samples=1000,
         seq_length=args.seq_length,
         num_classes=args.num_classes,
-    )
-    val_dataset = DummyDataset(
-        num_samples=100,
-        seq_length=args.seq_length,
-        num_classes=args.num_classes,
-    )
-
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
-
-    # Create model
-    model = SegmentationModel(
-        hidden_dim=args.hidden_dim,
-        num_classes=args.num_classes,
-        max_duration=args.max_duration,
     )
 
     # Callbacks
-    callbacks = [
-        LearningRateMonitor(logging_interval="step"),
-    ]
+    callbacks = [LearningRateMonitor(logging_interval="step")]
 
     # Trainer
-    # CRITICAL: precision=32 is required for numerical stability at T > 100K
+    # CRITICAL: precision=32 is required — the streaming semi-CRF algorithm requires
+    # float64 for the partition function. The head casts internally, but mixed-precision
+    # training produces NaN gradients at the float64↔fp16 boundary.
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
         accelerator=args.accelerator,
         devices=args.devices,
         strategy=args.strategy,
-        precision=32,  # REQUIRED for Semi-Markov CRF at scale
+        precision=32,  # REQUIRED — see module docstring
         callbacks=callbacks,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
 
-    # Train
+    head_name = "UncertaintySemiMarkovCRFHead" if args.uncertainty else "SemiMarkovCRFHead"
     print(f"\nTraining with {args.devices} device(s), strategy={args.strategy}")
-    print(f"Model: {args.num_classes} classes, max_duration={args.max_duration}")
+    print(f"CRF head: {head_name}, {args.num_classes} classes, max_duration={args.max_duration}")
     print(f"Sequence length: {args.seq_length}, batch size: {args.batch_size}\n")
 
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, datamodule)
 
     print("\nTraining complete!")
-    print(f"Final train loss: {trainer.callback_metrics.get('train/loss', 'N/A')}")
-    print(f"Final val loss: {trainer.callback_metrics.get('val/loss', 'N/A')}")
+    print(f"Final train loss: {trainer.callback_metrics.get('train/loss', 'N/A'):.4f}")
+    print(f"Final val loss:   {trainer.callback_metrics.get('val/loss', 'N/A'):.4f}")
 
 
 if __name__ == "__main__":

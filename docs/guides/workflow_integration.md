@@ -648,8 +648,7 @@ def extract_segments(labels):
 5. **Batch similar lengths together** to minimize padding waste.
 
 6. **First training call overhead**: The first call with `requires_grad=True`
-   incurs a one-time `torch.compile` overhead (a few seconds). Subsequent
-   calls reuse the cached compiled kernel.
+   incurs a small warmup cost as Triton compiles and caches kernels.
 
 ## Memory considerations
 

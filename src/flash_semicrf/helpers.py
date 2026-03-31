@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -177,10 +178,12 @@ def score_gold_vectorized(
     transition: torch.Tensor,
     duration_bias: torch.Tensor,
     max_duration: int,
+    proj_start: Optional[torch.Tensor] = None,
+    proj_end: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Score gold label sequences for Semi-CRF loss computation.
 
-    Computes :math:`\text{score}(y^*) = \sum_{\text{segments}} (\text{content} + \text{duration} + \text{transition})`
+    Computes :math:`\text{score}(y^*) = \sum_{\text{segments}} (\text{content} + \text{duration} + \text{transition} + \text{boundary})`
 
     Args:
         cum_scores (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`.
@@ -189,6 +192,10 @@ def score_gold_vectorized(
         transition (Tensor): Transition scores of shape :math:`(C, C)`.
         duration_bias (Tensor): Duration bias of shape :math:`(K, C)`.
         max_duration (int): Maximum segment duration (K).
+        proj_start (Tensor, optional): Start boundary scores of shape
+            :math:`(\text{batch}, T, C)`. Default: ``None``
+        proj_end (Tensor, optional): End boundary scores of shape
+            :math:`(\text{batch}, T, C)`. Default: ``None``
 
     Returns:
         Tensor: Gold sequence scores of shape :math:`(\text{batch},)`.
@@ -199,6 +206,19 @@ def score_gold_vectorized(
     T = T_plus_1 - 1
     validate_labels(labels, C, batch_size=batch, seq_length=T)
     validate_lengths(lengths, T, batch_size=batch)
+
+    if proj_start is not None:
+        if proj_start.shape != torch.Size([batch, T, C]):
+            raise ValueError(
+                f"proj_start must have shape (batch={batch}, T={T}, C={C}), "
+                f"got {tuple(proj_start.shape)}"
+            )
+    if proj_end is not None:
+        if proj_end.shape != torch.Size([batch, T, C]):
+            raise ValueError(
+                f"proj_end must have shape (batch={batch}, T={T}, C={C}), "
+                f"got {tuple(proj_end.shape)}"
+            )
 
     device = cum_scores.device
     dtype = cum_scores.dtype
@@ -217,6 +237,10 @@ def score_gold_vectorized(
         dur_idx = min(1, max_duration - 1)
         dur_bias = duration_bias[dur_idx, label_0]
         scores = content + dur_bias
+        if proj_start is not None:
+            scores = scores + proj_start[:, 0, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
+        if proj_end is not None:
+            scores = scores + proj_end[:, 0, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
         # Zero out scores for zero-length sequences
         scores = scores * (lengths > 0).to(dtype)
         return scores
@@ -249,8 +273,15 @@ def score_gold_vectorized(
         pos_indices = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
         valid_mask = pos_indices < lengths.unsqueeze(1)  # (batch, T)
 
+        # For K=1 each position t is its own segment [t, t], so start == end == t
+        total_per_pos = content_per_pos + dur_per_pos + trans_per_pos
+        if proj_start is not None:
+            total_per_pos = total_per_pos + proj_start.gather(2, labels_exp).squeeze(-1)
+        if proj_end is not None:
+            total_per_pos = total_per_pos + proj_end.gather(2, labels_exp).squeeze(-1)
+
         # Sum all components with masking
-        total_per_pos = (content_per_pos + dur_per_pos + trans_per_pos) * valid_mask.to(dtype)
+        total_per_pos = total_per_pos * valid_mask.to(dtype)
         return total_per_pos.sum(dim=1)  # (batch,)
 
     # Step 1: Detect segment boundaries (where label changes)
@@ -373,10 +404,27 @@ def score_gold_vectorized(
     first_seg_mask[:, 0] = True
     trans_scores = torch.where(first_seg_mask, torch.zeros_like(trans_scores), trans_scores)
 
-    # Step 4: Sum with masking
+    # Step 4: Boundary scores (optional)
+    # Safe indices: padding slots have seg_mask=False and will be zeroed out,
+    # but their index values must still be in-bounds for the gather to succeed.
+    if proj_start is not None or proj_end is not None:
+        safe_starts = seg_starts * seg_mask.long()  # 0 for padding (always valid)
+        safe_ends = seg_ends * seg_mask.long()
+        b_idx = torch.arange(batch, device=device).unsqueeze(1)  # (batch, 1)
+
+    total_per_segment = content_scores + dur_scores + trans_scores  # (batch, max_segments)
+
+    if proj_start is not None:
+        start_scores = proj_start[b_idx, safe_starts, seg_labels]  # (batch, max_seg)
+        total_per_segment = total_per_segment + start_scores
+
+    if proj_end is not None:
+        end_scores = proj_end[b_idx, safe_ends, seg_labels]  # (batch, max_seg)
+        total_per_segment = total_per_segment + end_scores
+
+    # Step 5: Sum with masking
     # Use torch.where instead of multiplication to avoid inf * 0 = NaN
     # This can happen if parameters drift to extreme values during training
-    total_per_segment = content_scores + dur_scores + trans_scores  # (batch, max_segments)
     total_per_segment = torch.where(
         seg_mask, total_per_segment, torch.zeros_like(total_per_segment)
     )

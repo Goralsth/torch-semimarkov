@@ -180,10 +180,8 @@ class UncertaintyMixin:
         else:
             scores = hidden_states
 
-        # Zero-center scores to match exact method preprocessing (see nn.py _build_edge_tensor)
-        scores_float = scores.double().detach()
-        if T > 1:
-            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
+        # Zero-center scores using masked mean (see nn.py _center_scores)
+        scores_float = self._center_scores(scores.detach(), lengths)
 
         # Build cumulative scores
         cum_scores = torch.zeros(
@@ -311,10 +309,8 @@ class UncertaintyMixin:
             # Make scores require grad
             scores_for_grad = scores.detach().requires_grad_(True)
 
-            # Zero-center scores to match exact method preprocessing (see nn.py _build_edge_tensor)
-            scores_centered = scores_for_grad.double()
-            if T > 1:
-                scores_centered = scores_centered - scores_centered.mean(dim=1, keepdim=True)
+            # Zero-center scores using masked mean (see nn.py _center_scores)
+            scores_centered = self._center_scores(scores_for_grad, lengths)
 
             # Build cumulative scores
             cum_scores = torch.zeros(
@@ -340,11 +336,11 @@ class UncertaintyMixin:
             # Backward to get per-position, per-label gradients
             partition.sum().backward()
 
-        # Gradient magnitude per position per class
+        # d(log Z)/d(score[t,c]) reflects the influence of label c at position t.
+        # Centering means gradients can be negative, so use softmax to convert
+        # to a proper distribution over classes at each position.
         grad = scores_for_grad.grad  # (batch, T, C)
-
-        # Convert to probabilities via softmax over classes
-        position_marginals = torch.softmax(grad.abs(), dim=-1)
+        position_marginals = torch.softmax(grad, dim=-1)
 
         return position_marginals
 

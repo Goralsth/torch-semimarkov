@@ -33,10 +33,8 @@ from pathlib import Path
 import torch
 from lib import (
     BenchmarkResult,
-    get_canonical_shapes,
     print_summary,
     run_single_benchmark,
-    sample_compile_friendly,
     sample_configurations,
     save_results,
     should_skip_config,
@@ -71,35 +69,6 @@ def main():
         help=(
             "Sample this many (T, K*C) configs from the full grid, anchored at "
             "min/max BTKC. Use 0 to run the full grid. Ignored if --compile-friendly is set."
-        ),
-    )
-    parser.add_argument(
-        "--compile-friendly",
-        action="store_true",
-        default=False,
-        help=(
-            "Use compile-aware sampling to minimize torch.compile overhead. "
-            "Groups configs by canonical shapes and samples representative configs. "
-            "Much faster than full grid when using triton backends with --use-compile."
-        ),
-    )
-    parser.add_argument(
-        "--max-canonical-shapes",
-        type=int,
-        default=8,
-        help=(
-            "Maximum number of unique canonical shapes to compile when using "
-            "--compile-friendly. More shapes = better coverage but longer compile time. "
-            "Default: 8"
-        ),
-    )
-    parser.add_argument(
-        "--samples-per-shape",
-        type=int,
-        default=2,
-        help=(
-            "Number of actual configs to benchmark per canonical shape when using "
-            "--compile-friendly. Default: 2"
         ),
     )
     parser.add_argument(
@@ -190,30 +159,11 @@ def main():
     full_config_count = len(T_list) * len(K_list) * len(C_list)
 
     # Choose sampling strategy
-    config_to_canonical: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-    canonical_shapes: list[tuple[int, int, int]] = []
-
-    if args.compile_friendly:
-        # Compile-aware sampling: minimize unique compiled shapes
-        configs, config_to_canonical = sample_compile_friendly(
-            T_list,
-            K_list,
-            C_list,
-            max_canonical_shapes=args.max_canonical_shapes,
-            samples_per_shape=args.samples_per_shape,
-        )
-        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
-        # Filter to only shapes we're actually using
-        used_canonical = set(config_to_canonical.values())
-        canonical_shapes = [s for s in canonical_shapes if s in used_canonical]
-    elif args.sample_configs > 0:
-        # Legacy sampling: sample by T and K*C range
+    if args.sample_configs > 0:
         configs = sample_configurations(T_list, K_list, C_list, args.B, args.sample_configs)
-        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
     else:
         # Full grid
         configs = [(T, K, C) for T in T_list for K in K_list for C in C_list]
-        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
 
     total_configs = len(configs) * len(backends) * len(semirings) * len(phases)
     completed = 0
@@ -226,16 +176,8 @@ def main():
     print(f"Phases: {phases}")
     print(f"Repeats: {args.repeats}")
 
-    if args.compile_friendly:
-        print(
-            f"Compile-friendly sampling: {len(configs)} configs mapping to "
-            f"{len(canonical_shapes)} canonical shapes"
-        )
-    elif args.sample_configs > 0 and len(configs) != full_config_count:
+    if args.sample_configs > 0 and len(configs) != full_config_count:
         print(f"Sampling {len(configs)} of {full_config_count} T/K/C configs by T and K*C range")
-
-    if canonical_shapes:
-        print(f"Canonical shapes for compilation: {len(canonical_shapes)}")
 
     print("-" * 80)
 

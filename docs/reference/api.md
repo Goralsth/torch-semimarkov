@@ -418,7 +418,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
     """
     O(KC) memory with hand-written Triton backward kernels.
 
-    Provides faster backward pass by avoiding torch.compile overhead.
+    Hand-written Triton forward and backward kernels.
     """
 ```
 

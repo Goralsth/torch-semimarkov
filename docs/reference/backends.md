@@ -35,7 +35,7 @@ The automatic backend selection always uses streaming for log/max semirings (the
 **Default: Streaming API** (`semi_crf_streaming_forward` or `SemiMarkovCRFHead`)
 
 - O(KC) memory via ring buffer (edges computed on-the-fly)
-- Hand-written Triton forward and backward kernels (no torch.compile overhead)
+- Hand-written Triton forward and backward kernels
 - Supports log and max semirings
 
 **Use the exact backend** (`SemiMarkov.logpartition`) when you have pre-computed edge
@@ -54,10 +54,8 @@ eliminating the need for the O(TxKxC²) edge tensor.
 - Linear batch scaling: memory grows as O(batchxTxC), not O(batchxTxKxC²)
 
 **Training advantages:**
-- Hand-written Triton forward and backward kernels (no compilation overhead)
-- No torch.compile latency
+- Hand-written Triton forward and backward kernels
 - No RecursionError from deep computational graphs
-- No OOM from compiled gradient buffers
 
 ### Supported semirings
 

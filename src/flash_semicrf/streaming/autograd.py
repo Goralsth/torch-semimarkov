@@ -27,6 +27,52 @@ except ImportError:
     launch_streaming_triton_backward = None
 
 
+# =============================================================================
+# Shared validation helpers (used by all backward methods)
+# =============================================================================
+
+
+def _check_partition(partition: torch.Tensor, context: str) -> None:
+    """Raise RuntimeError if partition contains NaN or Inf values.
+
+    Called at the start of every backward pass. A non-finite partition from
+    the forward pass means all gradients will be garbage; catching it here
+    gives a cleaner error message than letting NaN propagate into parameters.
+
+    Args:
+        partition (Tensor): Partition function values of shape ``(batch,)``.
+        context (str): Short label identifying the caller, e.g. ``"Triton"``.
+    """
+    if not torch.isfinite(partition).all():
+        nan_count = torch.isnan(partition).sum().item()
+        inf_count = torch.isinf(partition).sum().item()
+        raise RuntimeError(
+            f"Non-finite partition from forward pass ({context}): "
+            f"{nan_count} NaN, {inf_count} Inf. "
+            "Check forward pass numerical stability."
+        )
+
+
+def _check_tensor_finite(tensor: torch.Tensor, name: str, context: str) -> None:
+    """Raise RuntimeError if a gradient tensor contains NaN or Inf values.
+
+    Called after each backward computation to catch numerical instability
+    before corrupted gradients reach model parameters.
+
+    Args:
+        tensor (Tensor): Gradient tensor to validate.
+        name (str): Tensor name for the error message, e.g. ``"grad_cum_scores"``.
+        context (str): Short label identifying the caller, e.g. ``"Triton"``.
+    """
+    if not torch.isfinite(tensor).all():
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        raise RuntimeError(
+            f"Non-finite values in CRF backward ({context}): "
+            f"{name} has {nan_count} NaN, {inf_count} Inf"
+        )
+
+
 class SemiCRFStreaming(torch.autograd.Function):
     r"""Pure PyTorch autograd function for streaming Semi-CRF. O(KC) memory."""
 
@@ -96,16 +142,7 @@ class SemiCRFStreaming(torch.autograd.Function):
             proj_end,
         ) = ctx.saved_tensors
 
-        # Validate partition from forward pass before running backward
-        # If partition is already NaN/Inf, backward will produce garbage
-        if not torch.isfinite(partition).all():
-            nan_count = torch.isnan(partition).sum().item()
-            inf_count = torch.isinf(partition).sum().item()
-            raise RuntimeError(
-                f"Non-finite partition from forward pass (PyTorch): "
-                f"{nan_count} NaN, {inf_count} Inf. "
-                f"Check forward pass numerical stability."
-            )
+        _check_partition(partition, "PyTorch")
 
         grads = semi_crf_streaming_backward_pytorch(
             cum_scores,
@@ -124,15 +161,7 @@ class SemiCRFStreaming(torch.autograd.Function):
 
         grad_cum_scores, grad_transition, grad_duration_bias, grad_proj_start, grad_proj_end = grads
 
-        # Validate backward outputs - catch NaN/Inf before they corrupt parameters
-        # This helps debug stochastic NaN issues in training
-        if not torch.isfinite(grad_cum_scores).all():
-            nan_count = torch.isnan(grad_cum_scores).sum().item()
-            inf_count = torch.isinf(grad_cum_scores).sum().item()
-            raise RuntimeError(
-                f"Non-finite values in CRF backward (PyTorch): "
-                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
-            )
+        _check_tensor_finite(grad_cum_scores, "grad_cum_scores", "PyTorch")
 
         # Scale by upstream gradient
         #
@@ -190,6 +219,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         proj_end: Optional[torch.Tensor] = None,
         num_warps: int = 4,
         checkpoint_interval: Optional[int] = None,
+        precision: str = "float64",
     ) -> torch.Tensor:
         if semiring == "max":
             raise ValueError(
@@ -197,7 +227,6 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 "Use semi_crf_streaming_forward() with torch.no_grad() instead."
             )
 
-        # Use Triton kernel for forward
         partition, ring_checkpoints, actual_checkpoint_interval, log_norm_checkpoints = (
             launch_streaming_triton_kernel(
                 cum_scores.detach(),
@@ -210,14 +239,12 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 proj_start=proj_start.detach() if proj_start is not None else None,
                 proj_end=proj_end.detach() if proj_end is not None else None,
                 num_warps=num_warps,
+                precision=precision,
             )
         )
 
-        # Cast partition back to input dtype for return, but keep float64 for backward
-        partition_f64 = partition  # Keep float64 for backward pass
-        partition_return = partition.to(cum_scores.dtype)  # Return in input dtype to user
-
-        # Save float64 version for backward
+        # The Triton kernel always returns float64 partition. Save that for the
+        # backward (log_Z precision matters), but return in the caller's input dtype.
         ctx.save_for_backward(
             cum_scores,
             transition,
@@ -225,7 +252,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             lengths,
             ring_checkpoints,
             log_norm_checkpoints,
-            partition_f64,  # <-- float64
+            partition,  # float64 — used directly by launch_streaming_triton_backward
             proj_start,
             proj_end,
         )
@@ -233,8 +260,9 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         ctx.semiring = semiring
         ctx.checkpoint_interval = actual_checkpoint_interval
         ctx.num_warps = num_warps
+        ctx.precision = precision
 
-        return partition_return  # <-- in input dtype for user
+        return partition.to(cum_scores.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -250,20 +278,11 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             proj_end,
         ) = ctx.saved_tensors
 
-        # Validate partition from forward pass before running backward
-        # If partition is already NaN/Inf, backward will produce garbage
-        if not torch.isfinite(partition).all():
-            nan_count = torch.isnan(partition).sum().item()
-            inf_count = torch.isinf(partition).sum().item()
-            raise RuntimeError(
-                f"Non-finite partition from forward pass (Triton): "
-                f"{nan_count} NaN, {inf_count} Inf. "
-                f"Check forward pass numerical stability."
-            )
+        _check_partition(partition, "Triton")
 
-        # Use Triton backward kernel for gradient computation
-        # The kernel already scales by grad_output internally
-        # Note: launch_streaming_triton_backward returns 6 values; the 6th (boundary_marginals) is unused here
+        # launch_streaming_triton_backward scales gradients by grad_output internally.
+        # It returns 6 values; the 6th (boundary_marginals) is only populated when
+        # return_boundary_marginals=True, which autograd never requests.
         grad_cum_scores, grad_transition, grad_duration_bias, grad_proj_start, grad_proj_end, _ = (
             launch_streaming_triton_backward(
                 cum_scores,
@@ -278,36 +297,20 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 proj_start=proj_start,
                 proj_end=proj_end,
                 num_warps=ctx.num_warps,
+                precision=ctx.precision,
             )
         )
 
-        # Validate ALL backward outputs - catch NaN/Inf before they corrupt parameters
-        # This helps debug stochastic NaN issues in Triton kernels
         for name, tensor in [
             ("grad_cum_scores", grad_cum_scores),
             ("grad_transition", grad_transition),
             ("grad_duration_bias", grad_duration_bias),
         ]:
-            if not torch.isfinite(tensor).all():
-                nan_count = torch.isnan(tensor).sum().item()
-                inf_count = torch.isinf(tensor).sum().item()
-                raise RuntimeError(
-                    f"Non-finite values in CRF backward (Triton): "
-                    f"{name} has {nan_count} NaN, {inf_count} Inf"
-                )
+            _check_tensor_finite(tensor, name, "Triton")
 
         if grad_proj_start is not None:
-            for name, tensor in [
-                ("grad_proj_start", grad_proj_start),
-                ("grad_proj_end", grad_proj_end),
-            ]:
-                if not torch.isfinite(tensor).all():
-                    nan_count = torch.isnan(tensor).sum().item()
-                    inf_count = torch.isinf(tensor).sum().item()
-                    raise RuntimeError(
-                        f"Non-finite values in CRF backward (Triton): "
-                        f"{name} has {nan_count} NaN, {inf_count} Inf"
-                    )
+            _check_tensor_finite(grad_proj_start, "grad_proj_start", "Triton")
+            _check_tensor_finite(grad_proj_end, "grad_proj_end", "Triton")
 
         return (
             grad_cum_scores,
@@ -320,6 +323,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             grad_proj_end,
             None,  # num_warps
             None,  # checkpoint_interval
+            None,  # precision
         )
 
 
@@ -364,14 +368,7 @@ class LinearCRFStreaming(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         cum_scores, transition, duration_bias, lengths, partition = ctx.saved_tensors
 
-        # Validate partition before backward
-        if not torch.isfinite(partition).all():
-            nan_count = torch.isnan(partition).sum().item()
-            inf_count = torch.isinf(partition).sum().item()
-            raise RuntimeError(
-                f"Non-finite partition from forward pass (K=1): "
-                f"{nan_count} NaN, {inf_count} Inf."
-            )
+        _check_partition(partition, "K=1")
 
         grad_cum_scores, grad_transition, grad_duration_bias = linear_crf_backward_pytorch(
             cum_scores,
@@ -381,14 +378,7 @@ class LinearCRFStreaming(torch.autograd.Function):
             duration_bias,
         )
 
-        # Validate backward outputs
-        if not torch.isfinite(grad_cum_scores).all():
-            nan_count = torch.isnan(grad_cum_scores).sum().item()
-            inf_count = torch.isinf(grad_cum_scores).sum().item()
-            raise RuntimeError(
-                f"Non-finite values in K=1 backward: "
-                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
-            )
+        _check_tensor_finite(grad_cum_scores, "grad_cum_scores", "K=1")
 
         # Scale by upstream gradient
         batch = grad_output.shape[0]
@@ -452,14 +442,7 @@ class SemiCRFK2Streaming(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         cum_scores, transition, duration_bias, lengths, partition = ctx.saved_tensors
 
-        # Validate partition before backward
-        if not torch.isfinite(partition).all():
-            nan_count = torch.isnan(partition).sum().item()
-            inf_count = torch.isinf(partition).sum().item()
-            raise RuntimeError(
-                f"Non-finite partition from forward pass (K=2): "
-                f"{nan_count} NaN, {inf_count} Inf."
-            )
+        _check_partition(partition, "K=2")
 
         grad_cum_scores, grad_transition, grad_duration_bias = semi_crf_k2_backward_pytorch(
             cum_scores,
@@ -469,14 +452,7 @@ class SemiCRFK2Streaming(torch.autograd.Function):
             partition,
         )
 
-        # Validate backward outputs
-        if not torch.isfinite(grad_cum_scores).all():
-            nan_count = torch.isnan(grad_cum_scores).sum().item()
-            inf_count = torch.isinf(grad_cum_scores).sum().item()
-            raise RuntimeError(
-                f"Non-finite values in K=2 backward: "
-                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
-            )
+        _check_tensor_finite(grad_cum_scores, "grad_cum_scores", "K=2")
 
         # Scale by upstream gradient
         batch = grad_output.shape[0]
@@ -506,9 +482,9 @@ def semi_crf_streaming_forward(
     proj_start: Optional[torch.Tensor] = None,
     proj_end: Optional[torch.Tensor] = None,
     use_triton: bool = True,
-    use_compile: bool = False,  # Deprecated, kept for API compatibility
     num_warps: int = 4,
     checkpoint_interval: Optional[int] = None,
+    precision: str = "float64",
 ) -> torch.Tensor:
     r"""Compute Semi-CRF partition function with streaming edge computation.
 
@@ -622,8 +598,8 @@ def semi_crf_streaming_forward(
     # =========================================================================
     if K == 1:
         if proj_start is not None or proj_end is not None:
-            # K=1 fast path doesn't support boundary projections yet
-            # Fall through to generic implementation
+            # Boundary projections are not yet supported for the K=1 fast path.
+            # Skip to the generic K>=3 implementation below.
             pass
         elif needs_grad:
             return LinearCRFStreaming.apply(
@@ -648,8 +624,8 @@ def semi_crf_streaming_forward(
     # =========================================================================
     if K == 2:
         if proj_start is not None or proj_end is not None:
-            # K=2 fast path doesn't support boundary projections yet
-            # Fall through to generic implementation
+            # Boundary projections are not yet supported for the K=2 fast path.
+            # Skip to the generic K>=3 implementation below.
             pass
         elif needs_grad:
             return SemiCRFK2Streaming.apply(
@@ -702,6 +678,7 @@ def semi_crf_streaming_forward(
                 proj_end,
                 num_warps,
                 checkpoint_interval,
+                precision,
             )
         else:
             # Pure PyTorch path
@@ -731,6 +708,7 @@ def semi_crf_streaming_forward(
                 proj_start=proj_start,
                 proj_end=proj_end,
                 num_warps=num_warps,
+                precision=precision,
             )
             return partition
         else:

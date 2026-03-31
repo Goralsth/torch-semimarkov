@@ -337,6 +337,7 @@ def test_self_consistency(cfg: ScaleConfig, device: str, seed: int = 42) -> tupl
             lengths,
             K,
             use_triton=True,
+            precision="float32",
             checkpoint_interval=ckpt_interval,
         )
         log_Z_ag.sum().backward()
@@ -500,6 +501,7 @@ def test_finite_differences(
             lengths,
             K,
             use_triton=True,
+            precision="float32",
         ).sum()
 
     # Get autograd gradients
@@ -698,6 +700,7 @@ def test_training_convergence(cfg: ScaleConfig, device: str, seed: int = 42) -> 
             max_duration=K,
             hidden_dim=hidden_dim,
             init_scale=0.1,
+            precision="float32",
         ).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
