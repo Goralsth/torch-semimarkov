@@ -4,7 +4,7 @@
 
 Structured Sequence Decoding with Memory-Efficient Semi-CRF Inference
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm%20NC-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![CI](https://github.com/biobenkj/flash-semicrf/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/biobenkj/flash-semicrf/actions/workflows/ci.yml)
