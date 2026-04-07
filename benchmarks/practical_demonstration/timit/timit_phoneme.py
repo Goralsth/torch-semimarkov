@@ -379,6 +379,13 @@ def main():
             help="Add learnable start/end transition vectors (2C parameters). "
             "Equivalent to pytorch-crf's start_transitions/end_transitions.",
         )
+        lightning_parser.add_argument(
+            "--seed",
+            type=int,
+            default=None,
+            help="Random seed for reproducibility (calls L.seed_everything). "
+            "Omit for non-deterministic training.",
+        )
 
         # analyze-uncertainty subcommand
         ua_parser = subparsers.add_parser(
@@ -581,6 +588,9 @@ def main():
             )
             return
 
+        if args.seed is not None:
+            L.seed_everything(args.seed, workers=True)
+
         from flash_semicrf import UncertaintySemiMarkovCRFHead
 
         # Parse --devices: "1" → 1 (int), "2,3" → [2, 3] (list), "-1" → -1 (all)
@@ -627,11 +637,12 @@ def main():
         )
 
         # Save best checkpoint by val/per so analyze-uncertainty gets the best model
+        seed_tag = f"-seed{args.seed}" if args.seed is not None else ""
         ckpt_callback = ModelCheckpoint(
             monitor="val/per",
             mode="min",
             save_top_k=1,
-            filename=f"best-{args.model}-K{k}",
+            filename=f"best-{args.model}-K{k}{seed_tag}",
             save_last=True,
         )
 
@@ -668,6 +679,7 @@ def main():
         print(f"  Devices:       {devices} x {args.accelerator}")
         print(f"  Strategy:      {args.strategy}")
         print(f"  Epochs:        {args.epochs}")
+        print(f"  Seed:          {args.seed}")
         print("-" * 60)
         print(f"  Final val loss:        {final_loss}")
         print(f"  Final val PER:         {final_per}")
