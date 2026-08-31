@@ -229,14 +229,25 @@ def score_gold_vectorized(
     # Handle single-position sequences
     if T == 1:
         # Single segment per batch: content + duration_bias[dur_idx, label]
-        # Duration index convention: min(duration, K-1) where K = max_duration
-        # For K=1: min(1, 0) = 0. For K>1: min(1, K-1) = 1
+        # Duration index convention: duration d uses index d-1, matching
+        # compute_edge_block_streaming's `dur_idx = k - 1` (see
+        # streaming/pytorch_reference.py) so gold scoring and the partition
+        # read the same row for the same segment. A single-position segment
+        # has duration 1, so its index is 0 (clamped to K-1 for K=1).
         label_0 = labels[:, 0]  # (batch,)
         content = cum_scores[:, 1, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
         content -= cum_scores[:, 0, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
-        dur_idx = min(1, max_duration - 1)
+        dur_idx = min(0, max_duration - 1)
         dur_bias = duration_bias[dur_idx, label_0]
-        scores = content + dur_bias
+        # The partition's alpha recursion inits alpha[0, :] = 0 for every
+        # label (a uniform phantom predecessor) and unconditionally applies
+        # transition[c_src, c_dest] before summing over c_src -- so the FIRST
+        # segment of every path in Z carries an implicit
+        # logsumexp_{c_src} transition[c_src, c_dest] term. Gold scoring must
+        # include the same term for its first segment or NLL = log Z -
+        # score(y*) silently drops a real, label-dependent quantity.
+        init_transition = torch.logsumexp(transition, dim=0)  # (C,)
+        scores = content + dur_bias + init_transition[label_0]
         if proj_start is not None:
             scores = scores + proj_start[:, 0, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
         if proj_end is not None:
@@ -260,14 +271,18 @@ def score_gold_vectorized(
         dur_per_pos = duration_bias[0, labels]  # (batch, T)
 
         # Transition: transition[label[t-1], label[t]] for t >= 1
-        # First position has no incoming transition
+        # First position: the partition's alpha recursion inits alpha[0,:]=0
+        # for every label and unconditionally applies transition[c_src,
+        # c_dest], so the first segment carries an implicit
+        # logsumexp_{c_src} transition[c_src, c_dest] term rather than none.
         prev_labels = torch.zeros_like(labels)
         prev_labels[:, 1:] = labels[:, :-1]
         trans_flat = transition.view(-1)  # (C * C,)
         trans_indices = prev_labels * C + labels  # (batch, T)
         trans_per_pos = trans_flat[trans_indices]  # (batch, T)
-        # Zero out first position's transition
-        trans_per_pos[:, 0] = 0
+        init_transition = torch.logsumexp(transition, dim=0)  # (C,)
+        trans_per_pos = trans_per_pos.clone()
+        trans_per_pos[:, 0] = init_transition[labels[:, 0]]
 
         # Mask for valid positions
         pos_indices = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
@@ -374,11 +389,12 @@ def score_gold_vectorized(
     content_scores = content_all.gather(2, seg_labels_expanded).squeeze(-1)  # (batch, max_segments)
 
     # Duration scores
-    # Duration index convention: duration d uses index min(d, K-1) where K = max_duration
-    # For K=1: all durations map to index 0
-    # For K>1: duration d maps to min(d, K-1)
+    # Duration index convention: duration d uses index d-1, matching
+    # compute_edge_block_streaming's `dur_idx = k - 1` (see streaming/
+    # pytorch_reference.py) so gold scoring reads the same row the partition
+    # would for an identical segment. Clamped to K-1 for durations >= K.
     durations = seg_ends - seg_starts + 1  # (batch, max_segments), always >= 1
-    dur_indices = durations.clamp(max=max_duration - 1)
+    dur_indices = (durations - 1).clamp(max=max_duration - 1)
 
     # Gather duration bias: duration_bias[dur_idx, label]
     # duration_bias shape: (K, C), we need (batch, max_segments) values
@@ -388,7 +404,10 @@ def score_gold_vectorized(
 
     # Transition scores
     # Need transition[prev_label, curr_label] for segments 1, 2, ...
-    # First segment has no transition
+    # First segment: the partition's alpha recursion inits alpha[0,:]=0 for
+    # every label and unconditionally applies transition[c_src, c_dest], so
+    # the first segment of every path in Z carries an implicit
+    # logsumexp_{c_src} transition[c_src, c_dest] term -- not "no transition".
     prev_labels = torch.zeros_like(seg_labels)
     prev_labels[:, 1:] = seg_labels[:, :-1]  # Shift labels right
 
@@ -397,12 +416,12 @@ def score_gold_vectorized(
     trans_indices = prev_labels * C + seg_labels  # (batch, max_segments)
     trans_scores = trans_flat[trans_indices]  # (batch, max_segments)
 
-    # Zero out first segment's transition
-    # Zero out first segment's transition (no predecessor)
-    # Use torch.where to avoid inf * 0 = NaN
+    # Replace first segment's transition with the implicit init term
+    init_transition = torch.logsumexp(transition, dim=0)  # (C,)
     first_seg_mask = torch.zeros_like(seg_mask)
     first_seg_mask[:, 0] = True
-    trans_scores = torch.where(first_seg_mask, torch.zeros_like(trans_scores), trans_scores)
+    init_transition_scores = init_transition[seg_labels]  # (batch, max_segments)
+    trans_scores = torch.where(first_seg_mask, init_transition_scores, trans_scores)
 
     # Step 4: Boundary scores (optional)
     # Safe indices: padding slots have seg_mask=False and will be zeroed out,
